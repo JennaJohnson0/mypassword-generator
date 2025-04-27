@@ -10,6 +10,8 @@ import secrets
 import string
 import argparse
 import sys
+import hashlib
+import base64
 
 
 class PasswordGenerator:
@@ -112,6 +114,104 @@ class PasswordGenerator:
         
         # Shuffle to avoid predictable patterns
         secrets.SystemRandom().shuffle(password)
+        
+        return ''.join(password)
+    
+    def generate_from_key(
+        self,
+        key: str,
+        length: int = 12,
+        use_lowercase: bool = True,
+        use_uppercase: bool = True,
+        use_digits: bool = True,
+        use_special: bool = True,
+        exclude_ambiguous: bool = False,
+        site: str = "",
+        counter: int = 1
+    ) -> str:
+        """
+        Generate a deterministic password based on a user key.
+        
+        Args:
+            key: User's master key/password
+            length: Password length
+            use_lowercase: Include lowercase letters
+            use_uppercase: Include uppercase letters
+            use_digits: Include digits
+            use_special: Include special characters
+            exclude_ambiguous: Exclude ambiguous characters
+            site: Site name for unique passwords per site
+            counter: Counter for generating different passwords with same key
+        
+        Returns:
+            Deterministic password based on the key
+        """
+        if length < 4:
+            raise ValueError("Password length must be at least 4 characters")
+        
+        # Create unique input for hashing
+        input_data = f"{key}:{site}:{counter}".encode('utf-8')
+        
+        # Use PBKDF2 for key derivation
+        derived_key = hashlib.pbkdf2_hmac('sha256', input_data, b'salt', 100000)
+        
+        # Build character set
+        char_set = ""
+        if use_lowercase:
+            chars = self.lowercase
+            if exclude_ambiguous:
+                chars = ''.join(c for c in chars if c not in self.ambiguous)
+            char_set += chars
+        
+        if use_uppercase:
+            chars = self.uppercase
+            if exclude_ambiguous:
+                chars = ''.join(c for c in chars if c not in self.ambiguous)
+            char_set += chars
+        
+        if use_digits:
+            chars = self.digits
+            if exclude_ambiguous:
+                chars = ''.join(c for c in chars if c not in self.ambiguous)
+            char_set += chars
+        
+        if use_special:
+            char_set += self.special
+        
+        if not char_set:
+            raise ValueError("At least one character type must be enabled")
+        
+        # Generate password from derived key
+        password = []
+        for i in range(length):
+            # Use each byte of the derived key to select characters
+            byte_val = derived_key[i % len(derived_key)]
+            char_index = byte_val % len(char_set)
+            password.append(char_set[char_index])
+        
+        # Ensure character type requirements are met
+        has_lower = use_lowercase and any(c in self.lowercase for c in password)
+        has_upper = use_uppercase and any(c in self.uppercase for c in password)
+        has_digit = use_digits and any(c in self.digits for c in password)
+        has_special_char = use_special and any(c in self.special for c in password)
+        
+        # If requirements not met, force include required character types
+        requirements = []
+        if use_lowercase and not has_lower:
+            requirements.append(self.lowercase)
+        if use_uppercase and not has_upper:
+            requirements.append(self.uppercase)
+        if use_digits and not has_digit:
+            requirements.append(self.digits)
+        if use_special and not has_special_char:
+            requirements.append(self.special)
+        
+        # Replace characters to meet requirements
+        for i, req_chars in enumerate(requirements):
+            if i < len(password):
+                byte_val = derived_key[(i + length) % len(derived_key)]
+                char_index = byte_val % len(req_chars)
+                password[i] = req_chars[char_index]
         
         return ''.join(password)
     
@@ -245,6 +345,9 @@ def main():
     parser.add_argument("--no-capitalize", action="store_true", help="Don't capitalize passphrase words")
     parser.add_argument("--add-numbers", action="store_true", help="Add numbers to passphrase")
     parser.add_argument("--check", type=str, help="Check strength of provided password")
+    parser.add_argument("--key", type=str, help="Generate deterministic password from key")
+    parser.add_argument("--site", type=str, default="", help="Site name for unique passwords per site")
+    parser.add_argument("--counter", type=int, default=1, help="Counter for different passwords with same key")
     
     args = parser.parse_args()
     
@@ -269,6 +372,21 @@ def main():
                 for suggestion in strength['feedback']:
                     print(f"  • {suggestion}")
             
+        elif args.key:
+            for i in range(args.count):
+                password = generator.generate_from_key(
+                    key=args.key,
+                    length=args.length,
+                    use_lowercase=not args.no_lowercase,
+                    use_uppercase=not args.no_uppercase,
+                    use_digits=not args.no_digits,
+                    use_special=not args.no_special,
+                    exclude_ambiguous=args.exclude_ambiguous,
+                    site=args.site,
+                    counter=args.counter + i
+                )
+                print(password)
+        
         elif args.passphrase:
             for _ in range(args.count):
                 passphrase = generator.generate_passphrase(
