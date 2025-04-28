@@ -12,6 +12,13 @@ import argparse
 import sys
 import hashlib
 import base64
+import json
+import os
+import getpass
+from datetime import datetime
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class PasswordGenerator:
@@ -325,6 +332,197 @@ class PasswordGenerator:
         }
 
 
+class PasswordStore:
+    def __init__(self, store_file: str = None):
+        """Initialize password store with encrypted local storage."""
+        if store_file is None:
+            home_dir = os.path.expanduser("~")
+            self.store_file = os.path.join(home_dir, ".password_store.enc")
+        else:
+            self.store_file = store_file
+        
+        self.master_password = None
+        self.cipher_suite = None
+    
+    def _derive_key(self, password: str, salt: bytes) -> bytes:
+        """Derive encryption key from master password."""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key
+    
+    def _get_master_password(self) -> str:
+        """Get master password from user."""
+        if self.master_password is None:
+            try:
+                self.master_password = getpass.getpass("Enter master password: ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nPassword input cancelled.", file=sys.stderr)
+                sys.exit(1)
+            except Exception:
+                # Fallback for non-interactive environments
+                print("Enter master password: ", end="", flush=True)
+                self.master_password = input()
+        return self.master_password
+    
+    def _init_cipher(self, password: str, salt: bytes = None) -> tuple:
+        """Initialize cipher suite with master password."""
+        if salt is None:
+            salt = os.urandom(16)
+        
+        key = self._derive_key(password, salt)
+        cipher_suite = Fernet(key)
+        return cipher_suite, salt
+    
+    def _load_store(self) -> dict:
+        """Load and decrypt password store."""
+        if not os.path.exists(self.store_file):
+            return {"entries": {}, "metadata": {"created": datetime.now().isoformat()}}
+        
+        try:
+            with open(self.store_file, 'rb') as f:
+                data = f.read()
+            
+            if len(data) < 16:
+                return {"entries": {}, "metadata": {"created": datetime.now().isoformat()}}
+            
+            # Extract salt and encrypted data
+            salt = data[:16]
+            encrypted_data = data[16:]
+            
+            # Initialize cipher
+            master_password = self._get_master_password()
+            cipher_suite, _ = self._init_cipher(master_password, salt)
+            
+            # Decrypt and load JSON
+            decrypted_data = cipher_suite.decrypt(encrypted_data)
+            return json.loads(decrypted_data.decode())
+            
+        except Exception as e:
+            raise ValueError(f"Failed to decrypt password store. Wrong master password? Error: {e}")
+    
+    def _save_store(self, data: dict):
+        """Encrypt and save password store."""
+        master_password = self._get_master_password()
+        cipher_suite, salt = self._init_cipher(master_password)
+        
+        # Serialize and encrypt
+        json_data = json.dumps(data, indent=2).encode()
+        encrypted_data = cipher_suite.encrypt(json_data)
+        
+        # Save with salt prefix
+        with open(self.store_file, 'wb') as f:
+            f.write(salt + encrypted_data)
+        
+        # Set restrictive permissions
+        os.chmod(self.store_file, 0o600)
+    
+    def store_password(self, name: str, password: str, site: str = "", username: str = "", notes: str = ""):
+        """Store a password entry."""
+        data = self._load_store()
+        
+        entry = {
+            "password": password,
+            "site": site,
+            "username": username,
+            "notes": notes,
+            "created": datetime.now().isoformat(),
+            "modified": datetime.now().isoformat()
+        }
+        
+        if name in data["entries"]:
+            entry["created"] = data["entries"][name]["created"]
+        
+        data["entries"][name] = entry
+        data["metadata"]["modified"] = datetime.now().isoformat()
+        
+        self._save_store(data)
+        print(f"Password '{name}' stored successfully.")
+    
+    def retrieve_password(self, name: str) -> dict:
+        """Retrieve a password entry."""
+        data = self._load_store()
+        
+        if name not in data["entries"]:
+            raise ValueError(f"Password entry '{name}' not found.")
+        
+        return data["entries"][name]
+    
+    def list_passwords(self) -> list:
+        """List all password entries."""
+        data = self._load_store()
+        entries = []
+        
+        for name, entry in data["entries"].items():
+            entries.append({
+                "name": name,
+                "site": entry.get("site", ""),
+                "username": entry.get("username", ""),
+                "created": entry.get("created", ""),
+                "modified": entry.get("modified", "")
+            })
+        
+        return sorted(entries, key=lambda x: x["name"])
+    
+    def delete_password(self, name: str):
+        """Delete a password entry."""
+        data = self._load_store()
+        
+        if name not in data["entries"]:
+            raise ValueError(f"Password entry '{name}' not found.")
+        
+        del data["entries"][name]
+        data["metadata"]["modified"] = datetime.now().isoformat()
+        
+        self._save_store(data)
+        print(f"Password '{name}' deleted successfully.")
+    
+    def search_passwords(self, query: str) -> list:
+        """Search password entries by name or site."""
+        entries = self.list_passwords()
+        query_lower = query.lower()
+        
+        results = []
+        for entry in entries:
+            if (query_lower in entry["name"].lower() or 
+                query_lower in entry["site"].lower() or
+                query_lower in entry["username"].lower()):
+                results.append(entry)
+        
+        return results
+    
+    def export_passwords(self, output_file: str):
+        """Export passwords to JSON file (unencrypted - use carefully)."""
+        data = self._load_store()
+        
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"Passwords exported to {output_file}")
+        print("WARNING: Exported file is unencrypted. Handle with care.")
+    
+    def import_passwords(self, input_file: str):
+        """Import passwords from JSON file."""
+        with open(input_file, 'r') as f:
+            import_data = json.load(f)
+        
+        data = self._load_store()
+        
+        imported_count = 0
+        for name, entry in import_data.get("entries", {}).items():
+            data["entries"][name] = entry
+            imported_count += 1
+        
+        data["metadata"]["modified"] = datetime.now().isoformat()
+        self._save_store(data)
+        
+        print(f"Imported {imported_count} password entries.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate secure passwords and passphrases")
     parser.add_argument("-l", "--length", type=int, default=12, help="Password length (default: 12)")
@@ -349,9 +547,29 @@ def main():
     parser.add_argument("--site", type=str, default="", help="Site name for unique passwords per site")
     parser.add_argument("--counter", type=int, default=1, help="Counter for different passwords with same key")
     
+    # Storage commands
+    parser.add_argument("--store", type=str, help="Store password with given name")
+    parser.add_argument("--retrieve", type=str, help="Retrieve password by name")
+    parser.add_argument("--list", action="store_true", help="List all stored passwords")
+    parser.add_argument("--delete", type=str, help="Delete stored password by name")
+    parser.add_argument("--search", type=str, help="Search stored passwords")
+    parser.add_argument("--export", type=str, help="Export passwords to file")
+    parser.add_argument("--import", type=str, dest="import_file", help="Import passwords from file")
+    
+    # Storage metadata
+    parser.add_argument("--username", type=str, default="", help="Username for stored password")
+    parser.add_argument("--notes", type=str, default="", help="Notes for stored password")
+    parser.add_argument("--store-file", type=str, help="Custom password store file location")
+    parser.add_argument("--master-password", type=str, help="Master password for storage (for testing only - not secure!)")
+    
     args = parser.parse_args()
     
     generator = PasswordGenerator()
+    store = None
+    if any([args.store, args.retrieve, args.list, args.delete, args.search, args.export, args.import_file]):
+        store = PasswordStore(args.store_file)
+        if args.master_password:
+            store.master_password = args.master_password
     
     try:
         if args.check:
@@ -371,6 +589,86 @@ def main():
                 print("\nSuggestions:")
                 for suggestion in strength['feedback']:
                     print(f"  • {suggestion}")
+        
+        elif args.store:
+            if not store:
+                store = PasswordStore(args.store_file)
+            
+            # Generate password if not provided via stdin
+            if args.key:
+                password = generator.generate_from_key(
+                    key=args.key,
+                    length=args.length,
+                    use_lowercase=not args.no_lowercase,
+                    use_uppercase=not args.no_uppercase,
+                    use_digits=not args.no_digits,
+                    use_special=not args.no_special,
+                    exclude_ambiguous=args.exclude_ambiguous,
+                    site=args.site,
+                    counter=args.counter
+                )
+            else:
+                password = generator.generate_password(
+                    length=args.length,
+                    use_lowercase=not args.no_lowercase,
+                    use_uppercase=not args.no_uppercase,
+                    use_digits=not args.no_digits,
+                    use_special=not args.no_special,
+                    exclude_ambiguous=args.exclude_ambiguous,
+                    custom_chars=args.custom_chars,
+                    min_lowercase=args.min_lowercase,
+                    min_uppercase=args.min_uppercase,
+                    min_digits=args.min_digits,
+                    min_special=args.min_special
+                )
+            
+            store.store_password(args.store, password, args.site, args.username, args.notes)
+            print(f"Generated password: {password}")
+        
+        elif args.retrieve:
+            entry = store.retrieve_password(args.retrieve)
+            print(f"Name: {args.retrieve}")
+            print(f"Password: {entry['password']}")
+            if entry.get('site'):
+                print(f"Site: {entry['site']}")
+            if entry.get('username'):
+                print(f"Username: {entry['username']}")
+            if entry.get('notes'):
+                print(f"Notes: {entry['notes']}")
+            print(f"Created: {entry.get('created', 'Unknown')}")
+            print(f"Modified: {entry.get('modified', 'Unknown')}")
+        
+        elif args.list:
+            entries = store.list_passwords()
+            if not entries:
+                print("No passwords stored.")
+            else:
+                print(f"{'Name':<20} {'Site':<25} {'Username':<20} {'Modified':<20}")
+                print("-" * 85)
+                for entry in entries:
+                    modified = entry['modified'][:10] if entry['modified'] else 'Unknown'
+                    print(f"{entry['name']:<20} {entry['site']:<25} {entry['username']:<20} {modified:<20}")
+        
+        elif args.delete:
+            store.delete_password(args.delete)
+        
+        elif args.search:
+            results = store.search_passwords(args.search)
+            if not results:
+                print(f"No passwords found matching '{args.search}'.")
+            else:
+                print(f"Found {len(results)} matching entries:")
+                print(f"{'Name':<20} {'Site':<25} {'Username':<20} {'Modified':<20}")
+                print("-" * 85)
+                for entry in results:
+                    modified = entry['modified'][:10] if entry['modified'] else 'Unknown'
+                    print(f"{entry['name']:<20} {entry['site']:<25} {entry['username']:<20} {modified:<20}")
+        
+        elif args.export:
+            store.export_passwords(args.export)
+        
+        elif args.import_file:
+            store.import_passwords(args.import_file)
             
         elif args.key:
             for i in range(args.count):
